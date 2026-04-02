@@ -1,0 +1,65 @@
+models:
+  phi3:
+    path: "/Users/dante14594/.cache/mlx-manager/models/mlx-community/Phi-3-mini-4k-instruct-4bit"
+    port: 10240
+  coder:
+    path: "/Users/dante14594/.cache/mlx-manager/models/mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+    port: 10241
+  reasoner:
+    path: "/Users/dante14594/.cache/mlx-manager/models/mlx-community/Llama-3.1-8B-Instruct-4bit"
+    port: 10242
+
+llm_backends:
+  primary:
+    type: "mlx_openai"
+    base_url: "http://127.0.0.1:10242"
+    model_name: "reasoner"
+    max_tokens: 500
+    temperature: 0.7
+  fallback:
+    type: "mock"
+    response: "Fallback response: primary model is unavailable."
+
+prompts:
+  router:
+    version: "1.0"
+    template: |
+      Ты классификатор запросов. Отвечай ТОЛЬКО одним словом: coder, reasoner или reasoner. Никаких пояснений, никакого дополнительного текста.
+      Примеры:
+      Запрос: "напиши функцию на python"
+      Ответ: coder
+      Запрос: "объясни теорию относительности"
+      Ответ: reasoner
+      Запрос: "привет, как дела?"
+      Ответ: reasoner
+      Запрос: {query}
+      Ответ:
+  coder:
+    version: "1.0"
+    template: |
+      Ты помощник по написанию кода. Отвечай только кодом или краткими объяснениями. Не повторяй запрос.
+      Пользователь: {query}
+      Ответ:
+  reasoner:
+    version: "1.0"
+    template: |
+      Ты аналитик. Объясни подробно, логично, с примерами. Не повторяй запрос.
+      Пользователь: {query}
+      Ответ:
+
+runtime:
+  cleanup_interval: 60
+  idle_timeout: 300
+  max_concurrent_models: 2
+
+resilience:
+  timeout_seconds: 30
+  retry_attempts: 2
+  retry_delay_seconds: 1
+  circuit_breaker_failure_threshold: 3
+  circuit_breaker_recovery_timeout: 60
+
+fallback_chain:
+  - reasoner
+  - coder
+  - phi3
