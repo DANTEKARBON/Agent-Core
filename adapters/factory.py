@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from adapters.base_llm_adapter import BaseLLMAdapter
 
 class MockAdapter(BaseLLMAdapter):
@@ -26,13 +26,14 @@ class MockAdapter(BaseLLMAdapter):
 
 class LLMAdapterFactory:
     @staticmethod
-    def create(backend_config: Dict[str, Any]) -> BaseLLMAdapter:
+    def create(backend_config: Dict[str, Any], model_manager=None) -> BaseLLMAdapter:
         backend_type = backend_config.get("type", "").lower()
         if backend_type == "mlx_openai":
             from adapters.mlx_openai_adapter import MLXOpenAIAdapter
             return MLXOpenAIAdapter(
                 base_url=backend_config.get("base_url"),
-                model_path=backend_config.get("model_name", "default"),
+                model_name=backend_config.get("model_name", "default"),
+                model_manager=model_manager,
                 max_tokens=backend_config.get("max_tokens", 500),
                 temperature=backend_config.get("temperature", 0.7)
             )

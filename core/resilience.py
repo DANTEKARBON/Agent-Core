@@ -1,103 +1,84 @@
 import time
-import threading
 import functools
-from typing import Callable, Any, Dict, Optional
-import logging
+import threading
+from typing import Callable, Any, Tuple
+from core.errors import TimeoutError
+from logger_config import logger
 
-logger = logging.getLogger(__name__)
-
-class CircuitBreaker:
-    """
-    Circuit breaker pattern. Состояния:
-    - CLOSED: нормальная работа, пропускаем запросы.
-    - OPEN: запросы блокируются, возвращается ошибка.
-    - HALF_OPEN: пробуем один запрос, если успех -> закрываем, иначе снова открываем.
-    """
-    def __init__(self, name: str, failure_threshold: int = 3, recovery_timeout: float = 60.0):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self._state = "CLOSED"
-        self._failure_count = 0
-        self._last_failure_time = 0.0
-        self._lock = threading.Lock()
-
-    def call(self, func: Callable, *args, **kwargs) -> Any:
-        with self._lock:
-            if self._state == "OPEN":
-                if time.time() - self._last_failure_time >= self.recovery_timeout:
-                    self._state = "HALF_OPEN"
-                    logger.info(f"CircuitBreaker {self.name} перешёл в HALF_OPEN")
-                else:
-                    raise Exception(f"CircuitBreaker {self.name} OPEN, запрос отклонён")
-            # Для HALF_OPEN или CLOSED пропускаем вызов
-        try:
-            result = func(*args, **kwargs)
-            # Успех: сбрасываем счётчик
-            with self._lock:
-                if self._state == "HALF_OPEN":
-                    self._state = "CLOSED"
-                    self._failure_count = 0
-                    logger.info(f"CircuitBreaker {self.name} закрыт после успеха")
-                elif self._state == "CLOSED":
-                    self._failure_count = 0
-            return result
-        except Exception as e:
-            with self._lock:
-                self._failure_count += 1
-                self._last_failure_time = time.time()
-                if self._state == "CLOSED" and self._failure_count >= self.failure_threshold:
-                    self._state = "OPEN"
-                    logger.warning(f"CircuitBreaker {self.name} перешёл в OPEN после {self._failure_count} ошибок")
-                elif self._state == "HALF_OPEN":
-                    self._state = "OPEN"
-                    logger.warning(f"CircuitBreaker {self.name} вернулся в OPEN из HALF_OPEN после ошибки")
-            raise
-
-def with_retry(max_attempts: int = 2, delay: float = 1.0, backoff: float = 1.0):
-    """
-    Декоратор для повторных попыток при исключениях.
-    """
+def with_retry(attempts: int = 3, delay: float = 1.0, backoff: float = 2.0, 
+               exceptions: Tuple[Exception] = (Exception,), max_attempts: int = None):
+    actual_attempts = max_attempts if max_attempts is not None else attempts
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(1, max_attempts + 1):
+            last_exc = None
+            current_delay = delay
+            for attempt in range(actual_attempts):
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
-                    last_exception = e
-                    logger.warning(f"Retry {attempt}/{max_attempts} failed: {e}")
-                    if attempt < max_attempts:
-                        time.sleep(delay * (backoff ** (attempt - 1)))
-            raise last_exception
+                except exceptions as e:
+                    last_exc = e
+                    if attempt == actual_attempts - 1:
+                        raise
+                    time.sleep(current_delay)
+                    current_delay *= backoff
+            raise last_exc
         return wrapper
     return decorator
 
 def with_timeout(seconds: float):
-    """
-    Декоратор для таймаута. Использует threading.Timer для прерывания.
-    """
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             result = [None]
-            exception = [None]
-
+            error = [None]
             def target():
                 try:
                     result[0] = func(*args, **kwargs)
                 except Exception as e:
-                    exception[0] = e
-
+                    error[0] = e
             thread = threading.Thread(target=target)
             thread.daemon = True
             thread.start()
             thread.join(seconds)
             if thread.is_alive():
-                raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds")
-            if exception[0]:
-                raise exception[0]
+                raise TimeoutError(f"Function {func.__name__} timed out after {seconds}s")
+            if error[0] is not None:
+                raise error[0]
             return result[0]
         return wrapper
     return decorator
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = 0
+        self.state = "closed"  # closed, open, half-open
+        self.last_failure_time = 0
+        self._lock = threading.Lock()
+
+    def call(self, func: Callable, *args, **kwargs):
+        with self._lock:
+            if self.state == "open":
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    logger.info("Circuit breaker переходит в half-open")
+                    self.state = "half-open"
+                else:
+                    raise Exception("Circuit breaker is open")
+        try:
+            result = func(*args, **kwargs)
+            with self._lock:
+                if self.state == "half-open":
+                    logger.info("Circuit breaker закрыт (успешный вызов)")
+                    self.state = "closed"
+                    self.failures = 0
+            return result
+        except Exception as e:
+            with self._lock:
+                self.failures += 1
+                self.last_failure_time = time.time()
+                if self.failures >= self.failure_threshold:
+                    logger.warning(f"Circuit breaker открыт после {self.failures} ошибок")
+                    self.state = "open"
+            raise e

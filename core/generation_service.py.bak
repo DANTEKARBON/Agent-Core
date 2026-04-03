@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Optional
 from core.contracts import LLMResponse
 from core.cache import TTLCache
 from core.resilience import with_retry, with_timeout
-from core.errors import FallbackExhaustedError
+from core.errors import ModelError, FallbackExhaustedError
 from adapters.factory import LLMAdapterFactory
 from logger_config import logger
 
@@ -18,16 +18,20 @@ class GenerationService:
                 config = yaml.safe_load(f)
         self.config = config
         
+        # Создаём адаптеры через фабрику для всех моделей из секции models
         self.adapters = {}
         models_cfg = self.config.get("models", {})
+        # Берём параметры из primary (max_tokens, temperature) — можно будет потом вынести в конфиг каждой модели
         primary_cfg = self.config.get("llm_backends", {}).get("primary", {})
-        default_max_tokens = primary_cfg.get("max_tokens", 800)      # увеличен дефолт
+        default_max_tokens = primary_cfg.get("max_tokens", 500)
         default_temperature = primary_cfg.get("temperature", 0.7)
         
         for model_name, model_info in models_cfg.items():
             port = model_info.get("port")
             if not port:
+                logger.warning(f"Модель {model_name} не имеет порта, пропускаем")
                 continue
+            # Формируем конфиг для фабрики (тип mlx_openai, так как все текущие модели — mlx)
             backend_config = {
                 "type": "mlx_openai",
                 "base_url": f"http://127.0.0.1:{port}",
@@ -38,10 +42,11 @@ class GenerationService:
             try:
                 adapter = LLMAdapterFactory.create(backend_config)
                 self.adapters[model_name] = adapter
-                logger.info(f"Адаптер для {model_name} создан через фабрику на {backend_config['base_url']} с max_tokens={default_max_tokens}")
+                logger.info(f"Адаптер для {model_name} создан через фабрику на {backend_config['base_url']}")
             except Exception as e:
                 logger.error(f"Не удалось создать адаптер для {model_name}: {e}")
         
+        # Fallback-цепочка из конфига
         self.fallback_chain = self.config.get("fallback_chain", ["phi3", "coder"])
         self._last_metrics = {}
 
@@ -60,27 +65,26 @@ class GenerationService:
     @with_retry(attempts=2, delay=1.0)
     @with_timeout(seconds=30)
     def _call_adapter(self, adapter, prompt: str, template_key: str = None):
+        # Подстановка промпта из конфига, если есть шаблон для template_key
         prompts_cfg = self.config.get("prompts", {})
         if template_key and template_key in prompts_cfg:
             template = prompts_cfg[template_key].get("template", "")
             if template:
                 prompt = template.format(query=prompt)
-        
-        # Явно берём max_tokens из конфига модели (или из primary)
-        model_name = getattr(adapter, 'model_name', template_key)
-        models_cfg = self.config.get("models", {})
-        primary_cfg = self.config.get("llm_backends", {}).get("primary", {})
-        max_tokens = primary_cfg.get("max_tokens", 800)
-        temperature = primary_cfg.get("temperature", 0.7)
-        
-        # Переопределяем для конкретной модели, если есть отдельные настройки
-        if model_name in models_cfg:
-            # можно добавить per-model max_tokens в будущем
-            pass
-        
-        logger.info(f"Вызов адаптера для {model_name} с max_tokens={max_tokens}, temp={temperature}")
-        # Используем generate_contract с явными параметрами
-        return adapter.generate_contract(prompt, max_tokens=max_tokens, temperature=temperature)
+        result = adapter.generate(prompt)
+        if isinstance(result, dict):
+            text = result.get("response", "")
+            meta = result.get("metadata", {})
+            error = meta.get("error")
+            return LLMResponse(
+                text=text,
+                prompt_tokens=meta.get("input_tokens", 0),
+                completion_tokens=meta.get("output_tokens", 0),
+                total_tokens=meta.get("input_tokens", 0) + meta.get("output_tokens", 0),
+                status="error" if error else "success",
+                error=error
+            )
+        return result
 
     def generate(self, target_role: str, prompt: str) -> str:
         self._ensure_model_loaded(target_role)
@@ -111,7 +115,7 @@ class GenerationService:
             
             try:
                 start = time.time()
-                resp: LLMResponse = self._call_adapter(adapter, prompt, template_key=model_name)
+                resp = self._call_adapter(adapter, prompt, template_key=model_name)
                 elapsed_ms = (time.time() - start) * 1000
                 
                 if resp.status == "error":
@@ -127,14 +131,12 @@ class GenerationService:
                     "out": tokens_out,
                     "ms": elapsed_ms,
                     "t/s": tok_per_sec,
-                    "model": model_name,
-                    "ttft_ms": resp.ttft_ms,
+                    "model": model_name
                 }
                 
                 logger.info(f"⚡ {model_name} генерация", extra={
                     "in": tokens_in, "out": tokens_out,
-                    "ms": f"{elapsed_ms:.0f}", "t/s": f"{tok_per_sec:.1f}",
-                    "ttft_ms": f"{resp.ttft_ms:.0f}" if resp.ttft_ms else "N/A"
+                    "ms": f"{elapsed_ms:.0f}", "t/s": f"{tok_per_sec:.1f}"
                 })
                 
                 response_text = resp.text
@@ -148,6 +150,7 @@ class GenerationService:
         raise FallbackExhaustedError(f"Все модели {candidates} не смогли ответить. Последняя ошибка: {last_error}")
 
     def get_last_metrics(self) -> dict:
+        """Возвращает метрики последней генерации"""
         return self._last_metrics
 
     def clear_cache(self):

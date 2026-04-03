@@ -1,19 +1,27 @@
-class LLMError(Exception):
-    """Базовое исключение для LLM слоя."""
+"""
+Кастомные исключения для agent-core.
+"""
+
+class AgentError(Exception):
+    """Базовое исключение для всех ошибок агента."""
     pass
 
-class ModelLoadError(LLMError):
-    """Ошибка загрузки модели."""
+class ModelError(AgentError):
+    """Ошибка, связанная с LLM-моделью."""
     pass
 
-class ModelTimeoutError(LLMError):
-    """Таймаут при обращении к модели."""
+class FallbackExhaustedError(AgentError):
+    """Все модели из fallback-цепочки не смогли обработать запрос."""
     pass
 
-class ModelResponseError(LLMError):
-    """Некорректный ответ модели."""
+class CircuitBreakerOpenError(AgentError):
+    """Circuit breaker разомкнут."""
     pass
 
-class ClassificationError(LLMError):
-    """Ошибка классификации запроса."""
+class TimeoutError(AgentError):
+    """Превышено время ожидания."""
+    pass
+
+class CacheError(AgentError):
+    """Ошибка при работе с кэшем."""
     pass

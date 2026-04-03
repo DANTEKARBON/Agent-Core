@@ -1,43 +1,58 @@
 #!/usr/bin/env python3
-"""
-Основная точка входа. Обеспечивает интерактивный CLI с поддержкой команд.
-Использует rich для цветного вывода (если доступен), иначе обычный print.
-"""
-
 import sys
 import json
 import signal
 import re
 import yaml
+import time
+import psutil
 from pathlib import Path
 from typing import Optional
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.styles import Style
+from prompt_toolkit.patch_stdout import patch_stdout
 
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich import print as rprint
-    RICH_AVAILABLE = True
-    console = Console()
-except ImportError:
-    RICH_AVAILABLE = False
-    def rprint(*args, **kwargs):
-        print(*args)
-
-from core.orchestrator import AgentOrchestrator
-from core.tracing import trace_context
+from core.model_orchestrator import ModelOrchestrator
+from core.model_registry import ModelRegistry
+from core.tracing import trace_context, get_request_id
 from logger_config import logger
 import model_manager
 
-orchestrator: Optional[AgentOrchestrator] = None
+console = Console(color_system=None)
+
+orchestrator: Optional[ModelOrchestrator] = None
 mm: Optional[model_manager.ModelManager] = None
+registry: Optional[ModelRegistry] = None
+
+CACHE_FILE = "cache_dump.json"
+
+def get_model_names():
+    if registry:
+        return registry.list_models()
+    return []
+
+command_completer = WordCompleter(
+    ['/status', '/load', '/unload', '/trace', '/clear_cache', '/reset', '/stats', '/reload_config', '/exit', '/help'] + get_model_names(),
+    ignore_case=True,
+    sentence=True
+)
+
+prompt_style = Style.from_dict({'prompt': 'ansicyan bold'})
+history = FileHistory('.cli_history')
 
 def signal_handler(sig, frame):
-    logger.info(f"Received signal {sig}, shutting down...")
+    logger.info(f"Получен сигнал {sig}, завершение...")
     if orchestrator:
+        if hasattr(orchestrator, 'save_cache'):
+            orchestrator.save_cache(CACHE_FILE)
         orchestrator.shutdown()
-    if mm is not None and hasattr(mm, "shutdown"):
-        mm.shutdown()
     sys.exit(0)
 
 def clean_model_output(text: str) -> str:
@@ -48,206 +63,322 @@ def clean_model_output(text: str) -> str:
 def show_trace(request_id: str):
     log_file = Path("logs/agent.log")
     if not log_file.exists():
-        print(f"Лог-файл {log_file} не найден.")
+        console.print(f"Лог-файл {log_file} не найден.")
         return
 
-    entries = []
     with open(log_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get('request_id') == request_id:
-                entries.append(record)
+        lines = f.readlines()
 
-    if not entries:
-        print(f"Записи для request_id {request_id} не найдены.")
+    matching = []
+    for line in lines:
+        if f'"{request_id}"' in line or f'request_id": "{request_id}"' in line:
+            try:
+                data = json.loads(line)
+                matching.append(data)
+            except:
+                matching.append({"raw": line.strip()})
+
+    if not matching:
+        console.print(f"Нет записей для request_id {request_id}.")
         return
 
-    entries.sort(key=lambda x: x.get('timestamp', ''))
-    for entry in entries:
-        timestamp = entry.get('timestamp', '')
-        level = entry.get('level', 'info').upper()
-        event = entry.get('event', '')
-        if RICH_AVAILABLE:
-            console.print(f"[{timestamp}] [bold]{level}[/bold]: {event}")
+    for entry in matching:
+        if "raw" in entry:
+            console.print(entry["raw"])
         else:
-            print(f"[{timestamp}] {level}: {event}")
-        for k, v in entry.items():
-            if k not in ('timestamp', 'level', 'event', 'request_id'):
-                if RICH_AVAILABLE:
-                    console.print(f"  [dim]{k}: {v}[/dim]")
-                else:
-                    print(f"  {k}: {v}")
+            ts = entry.get('timestamp', '')[:19]
+            level = entry.get('level', 'info').upper()
+            event = entry.get('event', '')
+            extra = {k:v for k,v in entry.items() if k not in ('timestamp','level','event','request_id')}
+            console.print(f"[{ts}] {level}: {event}")
+            if extra:
+                console.print(f"  {extra}")
+
+def reload_config():
+    global orchestrator, registry, mm
+    try:
+        # Перезагружаем реестр
+        registry = ModelRegistry()
+        # Обновляем ModelManager (передаём новый registry)
+        if mm:
+            mm.registry = registry
+        # Обновляем оркестратор (создаём новый, старый корректно останавливаем)
+        if orchestrator:
+            orchestrator.shutdown()
+        orchestrator = ModelOrchestrator(model_manager=mm, model_registry=registry)
+        if hasattr(orchestrator, 'load_cache'):
+            orchestrator.load_cache(CACHE_FILE)
+        console.print("[green]✔ Конфигурация перезагружена[/green]")
+        logger.info("Конфигурация перезагружена по команде /reload_config")
+    except Exception as e:
+        logger.error(f"Ошибка перезагрузки конфигурации: {e}")
+        console.print(f"[red]Ошибка перезагрузки: {e}[/red]")
 
 def handle_command(cmd: str):
-    parts = cmd.split()
+    parts = cmd.strip().split()
     if not parts:
         return
     command = parts[0].lower()
 
     if command == '/exit':
-        print("Shutting down...")
+        logger.info("Завершение работы...")
         if orchestrator:
+            if hasattr(orchestrator, 'save_cache'):
+                orchestrator.save_cache(CACHE_FILE)
             orchestrator.shutdown()
-        if mm is not None and hasattr(mm, "shutdown"):
-            mm.shutdown()
         sys.exit(0)
 
     elif command == '/status':
         if mm:
             status = mm.get_status()
-            if RICH_AVAILABLE:
-                table = Table(title="Model Status")
-                table.add_column("Model", style="cyan")
-                table.add_column("Status", style="green")
-                table.add_column("Port", style="yellow")
-                for model, info in status.items():
-                    table.add_row(model, info['status'], str(info.get('port', 'N/A')))
-                console.print(table)
+            mem_info = {}
+            total_mem_gb = psutil.virtual_memory().total / (1024**3)
+            available_mem_gb = psutil.virtual_memory().available / (1024**3)
+            used_by_models_gb = 0.0
+            for model, info in status.items():
+                port = info.get('port')
+                proc_mem = 0.0
+                for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+                    try:
+                        for conn in proc.net_connections(kind='inet'):
+                            if conn.laddr.port == port and conn.status == 'LISTEN':
+                                proc_mem = proc.memory_info().rss / (1024**3)
+                                break
+                        if proc_mem > 0:
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                mem_info[model] = proc_mem
+                used_by_models_gb += proc_mem
+            
+            table = Table(title=f"Состояние моделей (система: {used_by_models_gb:.1f}GB / {total_mem_gb:.1f}GB, свободно: {available_mem_gb:.1f}GB)")
+            table.add_column("Модель")
+            table.add_column("Статус")
+            table.add_column("Порт")
+            table.add_column("Оцен.размер(GB)", justify="right")
+            table.add_column("Реал.память(GB)", justify="right")
+            for model, info in status.items():
+                mem = mem_info.get(model, 0.0)
+                est = info.get('size_gb', 0.0)
+                table.add_row(model, info['status'], str(info.get('port', 'N/A')), f"{est:.1f}", f"{mem:.1f}")
+            console.print(table)
+        else:
+            logger.error("Model manager не инициализирован.")
+
+    elif command == '/load':
+        if len(parts) < 2:
+            console.print("[yellow]Использование: /load <имя_модели>[/yellow]")
+            console.print(f"Доступные модели: {', '.join(get_model_names())}")
+            return
+        model_name = parts[1]
+        if mm:
+            if mm.is_loaded(model_name):
+                console.print(f"[green]✔ Модель {model_name} уже загружена[/green]")
+                return
+            try:
+                if not registry:
+                    logger.error("ModelRegistry не инициализирован")
+                    return
+                model_info = registry.get_model_info(model_name)
+                port = model_info["port"]
+                path = model_info["path"]
+                with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
+                    progress.add_task(description="Запуск модели...", total=None)
+                    success = mm.load_model(model_name, port, path)
+                if success:
+                    console.print(f"[green]✔ Модель {model_name} успешно загружена[/green]")
+                else:
+                    logger.error(f"Не удалось загрузить {model_name}.")
+            except KeyError:
+                logger.error(f"Модель {model_name} не найдена в реестре")
+                console.print(f"[red]Модель {model_name} не найдена в config.yaml[/red]")
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+        else:
+            logger.error("Model manager не инициализирован.")
+
+    elif command == '/unload':
+        if len(parts) < 2:
+            console.print("[yellow]Использование: /unload <имя_модели>[/yellow]")
+            return
+        model_name = parts[1]
+        if mm:
+            if mm.unload_model(model_name):
+                logger.info(f"Модель {model_name} выгружена.")
+                console.print(f"[green]✔ Модель {model_name} выгружена[/green]")
             else:
-                print("Model status:")
-                for model, info in status.items():
-                    print(f"  {model}: {info['status']} (port {info.get('port', 'N/A')})")
+                logger.warning(f"Модель {model_name} не загружена или не удалось выгрузить.")
+                console.print(f"[yellow]Модель {model_name} не была загружена[/yellow]")
         else:
-            print("Model manager not initialized.")
+            logger.error("Model manager не инициализирован.")
 
-    elif command == '/load' and len(parts) > 1:
-        model_name = parts[1]
-        if mm:
-            print(f"Loading {model_name}...")
-            try:
-                mm.load_model(model_name)
-                print(f"Model {model_name} loaded successfully.")
-            except Exception as e:
-                print(f"Failed to load {model_name}: {e}")
-        else:
-            print("Model manager not initialized.")
-
-    elif command == '/unload' and len(parts) > 1:
-        model_name = parts[1]
-        if mm:
-            print(f"Unloading {model_name}...")
-            try:
-                mm.unload_model(model_name)
-                print(f"Model {model_name} unloaded.")
-            except Exception as e:
-                print(f"Failed to unload {model_name}: {e}")
-        else:
-            print("Model manager not initialized.")
-
-    elif command == '/trace' and len(parts) > 1:
-        request_id = parts[1]
-        show_trace(request_id)
+    elif command == '/trace':
+        if len(parts) < 2:
+            console.print("[yellow]Использование: /trace <request_id>[/yellow]")
+            return
+        show_trace(parts[1])
 
     elif command == '/clear_cache':
-        if orchestrator and hasattr(orchestrator, 'clear_cache'):
+        if orchestrator:
             orchestrator.clear_cache()
-            print("Cache cleared.")
+            console.print("[green]✔ Кэш адаптеров очищен[/green]")
         else:
-            print("Clear cache method not available.")
+            logger.error("Оркестратор недоступен.")
 
     elif command == '/reset':
-        if orchestrator and hasattr(orchestrator, 'reset_context'):
-            orchestrator.reset_context()
-            print("Context reset.")
+        if orchestrator:
+            orchestrator.clear_cache()
+            console.print("[green]✔ Кэш адаптеров очищен (сброс контекста)[/green]")
         else:
-            print("Reset context method not available.")
+            logger.error("Оркестратор недоступен.")
+
+    elif command == '/stats':
+        if orchestrator and mm:
+            cache_stats = orchestrator.get_cache_stats()
+            model_status = mm.get_status()
+            loaded_models = [m for m, info in model_status.items() if info['status'] == 'running']
+            console.print(f"📊 Кэш адаптеров: {cache_stats.get('cached_adapters', 0)}")
+            console.print(f"🔌 Загруженные модели: {', '.join(loaded_models) if loaded_models else 'нет'}")
+        else:
+            logger.error("Оркестратор или ModelManager недоступны.")
+
+    elif command == '/reload_config':
+        reload_config()
 
     elif command == '/help':
-        print("Available commands:")
-        print("  /status           - Show model status")
-        print("  /load <model>     - Load a model (if not already loaded)")
-        print("  /unload <model>   - Unload a model")
-        print("  /trace <id>       - Show trace for a request ID")
-        print("  /clear_cache      - Clear classification and generation caches")
-        print("  /reset            - Reset conversation context")
-        print("  /exit             - Exit the program")
-        print("  /help             - Show this help")
+        help_text = """
+Доступные команды:
+  /status               - показать загруженные модели и память
+  /load <модель>        - загрузить модель (из config.yaml)
+  /unload <модель>      - выгрузить модель
+  /trace <request_id>   - показать логи по запросу
+  /clear_cache          - очистить кэш адаптеров
+  /reset                - очистить кэш адаптеров (сброс контекста)
+  /stats                - показать статистику кэша и загруженные модели
+  /reload_config        - перезагрузить конфигурацию без перезапуска
+  /exit                 - выход
+  /help                 - эта справка
+        """
+        console.print(Panel(help_text, title="Помощь"))
+
     else:
-        print(f"Unknown command: {command}")
+        console.print(f"Неизвестная команда: {command}")
 
 def main():
-    global orchestrator, mm
+    global orchestrator, mm, registry
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Загружаем конфиг, чтобы получить runtime-параметры
     try:
         with open("config.yaml", "r") as f:
             config = yaml.safe_load(f)
         runtime_config = config.get("runtime", {})
         cleanup_interval = runtime_config.get("cleanup_interval", 60)
-        idle_timeout = runtime_config.get("idle_timeout", 300)
+        idle_timeout = runtime_config.get("idle_timeout", 600)
         max_concurrent_models = runtime_config.get("max_concurrent_models", 2)
-        logger.info(f"Runtime config loaded: cleanup={cleanup_interval}s, idle_timeout={idle_timeout}s, max_models={max_concurrent_models}")
+        logger.info(f"Конфигурация runtime загружена", extra={"cleanup": cleanup_interval, "idle": idle_timeout, "max_models": max_concurrent_models})
     except Exception as e:
-        logger.error(f"Failed to load config.yaml, using defaults: {e}")
+        logger.error(f"Не удалось загрузить config.yaml, используются значения по умолчанию: {e}")
         cleanup_interval = 60
-        idle_timeout = 300
+        idle_timeout = 600
         max_concurrent_models = 2
 
-    # Создаём единый model_manager с параметрами из конфига
+    # Сначала создаём реестр
+    try:
+        registry = ModelRegistry()
+        logger.info("ModelRegistry инициализирован", extra={"models": registry.list_models()})
+    except Exception as e:
+        logger.error(f"Не удалось инициализировать ModelRegistry: {e}")
+        sys.exit(1)
+
+    # Затем ModelManager с передачей registry
     try:
         mm = model_manager.ModelManager(
             cleanup_interval=cleanup_interval,
             idle_timeout=idle_timeout,
-            max_concurrent_models=max_concurrent_models
+            max_concurrent_models=max_concurrent_models,
+            registry=registry
         )
-        logger.info("Model manager initialized with runtime config")
+        logger.info("Model manager инициализирован")
     except Exception as e:
-        logger.error(f"Failed to initialize model manager: {e}")
+        logger.error(f"Не удалось инициализировать model manager: {e}")
         mm = None
 
-    # Инициализируем оркестратор, передавая ему тот же model_manager
+    # Оркестратор
     try:
-        orchestrator = AgentOrchestrator(model_manager=mm)
+        orchestrator = ModelOrchestrator(model_manager=mm, model_registry=registry)
+        if hasattr(orchestrator, 'load_cache'):
+            orchestrator.load_cache(CACHE_FILE)
     except Exception as e:
-        logger.exception("Failed to initialize orchestrator")
+        logger.exception("Не удалось инициализировать оркестратор")
         sys.exit(1)
 
-    if RICH_AVAILABLE:
-        console.print("[bold green]Dante Agent Core started.[/bold green]")
-        console.print("Type [bold]/help[/bold] for commands, or enter a query.")
-    else:
-        print("Dante Agent Core started.")
-        print("Type /help for commands, or enter a query.")
+    console.print("[bold magenta]Dante Agent Core готов к работе (новая архитектура).[/bold magenta]")
+    console.print("💡 Введите [yellow]/help[/yellow] для списка команд или просто задайте вопрос.")
 
-    while True:
-        try:
-            user_input = input("\n> ").strip()
-            if user_input.startswith(">"):
-                user_input = user_input[1:].strip()
-            if not user_input:
-                continue
+    session = PromptSession(history=history, auto_suggest=AutoSuggestFromHistory(), completer=command_completer, style=prompt_style)
 
-            if user_input.startswith('/'):
-                handle_command(user_input)
-                continue
+    with patch_stdout():
+        while True:
+            try:
+                user_input = session.prompt([('class:prompt', '> ')], completer=command_completer)
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
 
-            with trace_context() as ctx:
-                # Удалён вызов orchestrator.reset_context() — теперь контекст не сбрасывается на каждый запрос
-                response = orchestrator.process(user_input)
+                if user_input.startswith('/'):
+                    handle_command(user_input)
+                    continue
+
+                start_time = time.time()
+                with trace_context() as ctx:
+                    response, target_role, metrics, raw_classifier = orchestrator.process(user_input)
+                    request_id = ctx.request_id
+                elapsed_ms = (time.time() - start_time) * 1000
 
                 clean_response = clean_model_output(response)
 
-                if RICH_AVAILABLE:
-                    console.print(Panel(clean_response, title="Response", border_style="blue"))
-                else:
-                    print("Response:")
-                    print(clean_response)
+                if target_role is None or target_role == "":
+                    target_role = "unknown"
+                if raw_classifier is None or raw_classifier == "":
+                    raw_classifier = "empty"
 
-        except KeyboardInterrupt:
-            print("\nInterrupted. Use /exit to quit.")
-            continue
-        except Exception as e:
-            logger.exception("Unhandled error in main loop")
-            print(f"Error: {e}")
+                display_raw = raw_classifier
+                if "ошибка" in raw_classifier.lower() or "exception" in raw_classifier.lower() or "traceback" in raw_classifier.lower():
+                    display_raw = "error"
+                elif len(raw_classifier) > 30:
+                    display_raw = raw_classifier[:27] + "..."
+
+                title_parts = [f"[{target_role}]"]
+                title_parts.append(f"[raw:{display_raw}]")
+                title_parts.append(f"id:{request_id}")
+                title_parts.append(f"{elapsed_ms:.0f}мс")
+                if metrics:
+                    if 'in' in metrics and 'out' in metrics:
+                        title_parts.append(f"tok {metrics['in']}→{metrics['out']}")
+                    if 'ttft_ms' in metrics and metrics['ttft_ms'] is not None:
+                        title_parts.append(f"TTFT {metrics['ttft_ms']:.0f}мс")
+                    if 't/s' in metrics and metrics['t/s'] > 0:
+                        title_parts.append(f"{metrics['t/s']:.1f} tok/s")
+                title = " | ".join(title_parts)
+
+                panel = Panel(clean_response, title=title)
+                console.print(panel)
+                console.print("─" * console.width)
+
+            except KeyboardInterrupt:
+                console.print("\nПрерывание. Используйте /exit для выхода.")
+                continue
+            except EOFError:
+                console.print("\nВыход...")
+                break
+            except Exception as e:
+                logger.exception("Необработанная ошибка в главном цикле")
+                console.print(f"Ошибка: {e}")
+
+    if orchestrator:
+        orchestrator.shutdown()
 
 if __name__ == "__main__":
     main()

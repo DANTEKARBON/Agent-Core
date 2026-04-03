@@ -2,3 +2,5 @@ pyyaml
 requests
 structlog
 psutil
+prompt-toolkit
+rich

@@ -1,3 +1,27 @@
+# Конфигурация ролей (поведение)
+roles:
+  coder:
+    prompt_template: |
+      Ты — ассистент по написанию кода. ВСЕГДА отвечай полным рабочим кодом с комментариями. Если язык не указан, используй Python. Если задача не конкретна, напиши пример для типовой задачи (например, сортировка пузырьком). НЕ ПРОСИ УТОЧНИТЬ — СРАЗУ ДАВАЙ РЕШЕНИЕ.
+      Пользователь: {query}
+      Ответ:
+    max_tokens: 800
+    temperature: 0.2
+  reasoner:
+    prompt_template: |
+      Ты аналитик. Объясни подробно, логично, с примерами. Отвечай развёрнуто, не менее 3-5 предложений. Не обрывай мысль.
+      Пользователь: {query}
+      Ответ:
+    max_tokens: 1500
+    temperature: 0.5
+  assistant:
+    prompt_template: |
+      Ты дружелюбный ассистент. Отвечай кратко, но законченно (2-3 предложения). Завершай мысль. Не пиши код, если не просят. Не перечисляй пункты.
+      Пользователь: {query}
+      Ответ:
+    max_tokens: 500
+    temperature: 0.7
+
 models:
   phi3:
     path: "/Users/dante14594/.cache/mlx-manager/models/mlx-community/Phi-3-mini-4k-instruct-4bit"
@@ -9,12 +33,17 @@ models:
     path: "/Users/dante14594/.cache/mlx-manager/models/mlx-community/Llama-3.1-8B-Instruct-4bit"
     port: 10242
 
+role_model_mapping:
+  coder: coder
+  reasoner: reasoner
+  assistant: phi3
+
 llm_backends:
   primary:
     type: "mlx_openai"
     base_url: "http://127.0.0.1:10242"
     model_name: "reasoner"
-    max_tokens: 500
+    max_tokens: 800
     temperature: 0.7
   fallback:
     type: "mock"
@@ -24,42 +53,29 @@ prompts:
   router:
     version: "1.0"
     template: |
-      Ты классификатор запросов. Отвечай ТОЛЬКО одним словом: coder, reasoner или reasoner. Никаких пояснений, никакого дополнительного текста.
+      Ты классификатор запросов. Отвечай ТОЛЬКО одним словом: coder, reasoner или assistant. Никаких пояснений, никакого дополнительного текста.
       Примеры:
       Запрос: "напиши функцию на python"
       Ответ: coder
       Запрос: "объясни теорию относительности"
       Ответ: reasoner
       Запрос: "привет, как дела?"
-      Ответ: reasoner
+      Ответ: assistant
       Запрос: {query}
-      Ответ:
-  coder:
-    version: "1.0"
-    template: |
-      Ты помощник по написанию кода. Отвечай только кодом или краткими объяснениями. Не повторяй запрос.
-      Пользователь: {query}
-      Ответ:
-  reasoner:
-    version: "1.0"
-    template: |
-      Ты аналитик. Объясни подробно, логично, с примерами. Не повторяй запрос.
-      Пользователь: {query}
       Ответ:
 
 runtime:
   cleanup_interval: 60
-  idle_timeout: 300
+  idle_timeout: 600
   max_concurrent_models: 2
 
 resilience:
-  timeout_seconds: 30
+  timeout_seconds: 60
   retry_attempts: 2
   retry_delay_seconds: 1
   circuit_breaker_failure_threshold: 3
   circuit_breaker_recovery_timeout: 60
 
 fallback_chain:
-  - reasoner
+  - assistant
   - coder
-  - phi3

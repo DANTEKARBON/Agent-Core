@@ -1,95 +1,75 @@
-"""
-Настройка структурированного логирования.
-Логи пишутся в файл в формате JSON и в консоль в текстовом формате.
-"""
-
 import logging
-import sys
+import json
 from pathlib import Path
-
-import structlog
-from structlog.processors import JSONRenderer
-from structlog.dev import ConsoleRenderer
-
-# Импортируем функцию получения request_id
+from datetime import datetime
 from core.tracing import get_request_id
 
-def add_request_id(logger, method_name, event_dict):
-    """
-    Добавляет request_id в словарь события, если он установлен в контексте.
-    """
-    request_id = get_request_id()
-    if request_id:
-        event_dict['request_id'] = request_id
-    return event_dict
+# Убедимся, что директория logs существует
+Path("logs").mkdir(exist_ok=True)
 
-# Общие процессоры для всех логгеров
-shared_processors = [
-    structlog.stdlib.add_log_level,
-    structlog.stdlib.PositionalArgumentsFormatter(),
-    add_request_id,                     # наш кастомный процессор
-    structlog.processors.TimeStamper(fmt="iso"),
-]
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname.lower(),
+            "event": record.getMessage(),
+        }
+        request_id = getattr(record, 'request_id', None)
+        if not request_id:
+            request_id = get_request_id()
+        if request_id:
+            log_entry["request_id"] = request_id
 
-# Конфигурация structlog для стандартного использования
-structlog.configure(
-    processors=shared_processors + [
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        JSONRenderer()                  # по умолчанию JSON, но для консоли переопределим
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
+        if hasattr(record, 'extra') and isinstance(record.extra, dict):
+            log_entry.update(record.extra)
 
-# Настройка стандартного модуля logging
-logging.basicConfig(
-    format="%(message)s",
-    level=logging.INFO,
-    handlers=[]
-)
+        if record.name:
+            log_entry["logger"] = record.name
 
-# Создаём папку для логов, если её нет
-log_dir = Path("logs")
-log_dir.mkdir(exist_ok=True)
+        return json.dumps(log_entry, ensure_ascii=False)
 
-# Обработчик для файла (JSON)
+# Настройка корневого логгера — ТОЛЬКО ФАЙЛ
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Удаляем все существующие обработчики
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Добавляем только файловый обработчик
 file_handler = logging.FileHandler("logs/agent.log", encoding="utf-8")
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter("%(message)s"))
+file_handler.setFormatter(JSONFormatter())
+root_logger.addHandler(file_handler)
 
-# Обработчик для консоли (текст)
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
+# Создаём логгер для использования в коде
+logger = logging.getLogger("agent-core")
 
-# Переопределяем процессоры для консольного обработчика, чтобы он выводил текст
-def console_renderer():
-    return structlog.dev.ConsoleRenderer()
+# Обёртка для поддержки extra
+original_log = logger._log
 
-# Для консоли используем отдельную конфигурацию процессоров
-console_processors = shared_processors + [
-    structlog.processors.StackInfoRenderer(),
-    structlog.processors.format_exc_info,
-    structlog.processors.UnicodeDecoder(),
-    console_renderer(),
-]
+def _log(self, level, msg, args, exc_info=None, extra=None, **kwargs):
+    if extra is None:
+        extra = {}
+    if 'request_id' not in extra:
+        req_id = get_request_id()
+        if req_id:
+            extra['request_id'] = req_id
+    original_log(level, msg, args, exc_info=exc_info, extra={'extra': extra} if extra else None, **kwargs)
 
-# Создаём логгер для консоли
-console_logger = structlog.wrap_logger(
-    logging.getLogger("console"),
-    processors=console_processors,
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
+logger._log = _log.__get__(logger, type(logger))
 
-# Добавляем обработчики
-logging.getLogger().addHandler(file_handler)
-logging.getLogger().addHandler(console_handler)
+# Добавим удобные функции
+def info(msg, extra=None, **kwargs):
+    logger.info(msg, extra={'extra': extra} if extra else None, **kwargs)
 
-# Для удобства экспортируем логгер
-logger = structlog.get_logger()
+def error(msg, extra=None, **kwargs):
+    logger.error(msg, extra={'extra': extra} if extra else None, **kwargs)
+
+def warning(msg, extra=None, **kwargs):
+    logger.warning(msg, extra={'extra': extra} if extra else None, **kwargs)
+
+def debug(msg, extra=None, **kwargs):
+    logger.debug(msg, extra={'extra': extra} if extra else None, **kwargs)
+
+def exception(msg, extra=None, **kwargs):
+    logger.exception(msg, extra={'extra': extra} if extra else None, **kwargs)

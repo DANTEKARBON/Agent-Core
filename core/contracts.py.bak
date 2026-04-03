@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
 @dataclass
@@ -11,7 +11,7 @@ class LLMResponse:
     model_name: Optional[str] = None
     status: str = "success"  # 'success' or 'error'
     error: Optional[str] = None
-    ttft_ms: Optional[float] = None  # время до первого токена (ms)
+    ttft_ms: Optional[float] = None  # время до первого токена
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LLMResponse":
