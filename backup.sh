@@ -6,13 +6,21 @@ BACKUP_DIR="$PROJECT_DIR/backups"
 GIT_BRANCH="main"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$BACKUP_DIR/backup.log"
+LAST_BACKUP_FILE="$BACKUP_DIR/last_backup_date"
+TODAY=$(date +%Y%m%d)
 
 mkdir -p "$BACKUP_DIR"
 cd "$PROJECT_DIR"
 
+# Проверка: если сегодня бэкап уже был - выходим
+if [ -f "$LAST_BACKUP_FILE" ] && [ "$(cat $LAST_BACKUP_FILE)" = "$TODAY" ]; then
+    echo "[$TIMESTAMP] Сегодня бэкап уже был, пропускаем" >> "$LOG_FILE"
+    exit 0
+fi
+
 echo "[$TIMESTAMP] Запуск бэкапа..." >> "$LOG_FILE"
 
-# 1. Git backup (если есть изменения)
+# 1. Git backup
 if [ -d ".git" ]; then
     git add .
     if ! git diff --cached --quiet; then
@@ -26,7 +34,7 @@ else
     echo "[$TIMESTAMP] Git репозиторий не найден" >> "$LOG_FILE"
 fi
 
-# 2. Локальный архив (исключая venv, .git, logs, backups)
+# 2. Локальный архив
 ARCHIVE_NAME="agent-core-backup-$TIMESTAMP.tar.gz"
 tar -czf "$BACKUP_DIR/$ARCHIVE_NAME" \
     --exclude=venv \
@@ -44,5 +52,8 @@ echo "[$TIMESTAMP] Создан локальный архив: $BACKUP_DIR/$ARCH
 # 3. Удаляем архивы старше 30 дней
 find "$BACKUP_DIR" -name "*.tar.gz" -mtime +30 -delete
 echo "[$TIMESTAMP] Старые архивы (>30 дней) удалены" >> "$LOG_FILE"
+
+# Записываем дату сегодняшнего бэкапа
+echo "$TODAY" > "$LAST_BACKUP_FILE"
 
 echo "[$TIMESTAMP] Бэкап завершён" >> "$LOG_FILE"
